@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS t_transcode_job (
     profile_id    BIGINT      NOT NULL COMMENT '档位 id（t_transcode_profile.id）',
     owner_dept    VARCHAR(64) NOT NULL COMMENT '归属部门（冗余自素材，配额与台账按它归集）',
     priority      INT         NOT NULL DEFAULT 5 COMMENT '优先级，越小越先做',
-    status        VARCHAR(16) NOT NULL DEFAULT 'PENDING' COMMENT 'PENDING 待处理 / RUNNING 处理中 / SUCCESS 成功 / FAILED 失败 / CANCELLED 已取消',
+    status        VARCHAR(16) NOT NULL DEFAULT 'PENDING' COMMENT 'PENDING 待处理 / RUNNING 处理中 / SUCCESS 成功（待审）/ DONE 已完成（审核通过）/ FAILED 失败（跑失败或审核驳回）/ CANCELLED 已取消',
     attempt_count INT         NOT NULL DEFAULT 0 COMMENT '已尝试次数',
     max_attempts  INT         NOT NULL DEFAULT 3 COMMENT '最多尝试次数',
     progress      INT         NOT NULL DEFAULT 0 COMMENT '进度 0-100',

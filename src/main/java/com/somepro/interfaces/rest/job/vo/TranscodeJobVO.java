@@ -10,13 +10,17 @@ import java.time.LocalDateTime;
  * - delFlag：内部软删状态
  * - createBy / updateBy：内部审计人
  * - updateTime：内部维护时间
- * - review*：审核字段属于后续审核流程，当前接口不暴露
  * 这些字段留在领域对象与 PO 里，不进 API 契约 —— 改库表不会连带改接口。
+ *
+ * 审核四件套（reviewResult/reviewComment/reviewBy/reviewTime）在审核流程上线后对外暴露：
+ * 没审过时全部为 null；审核结论 PASS/REJECT、审核意见、审核人（登录账号）、审核时刻只读，
+ * 一律由审核动作落库，不接受前端写入。
  */
 public record TranscodeJobVO(Long id, String jobNo, Long assetId, Long profileId, String ownerDept,
                              Integer priority, String status, Integer attemptCount, Integer maxAttempts,
                              Integer progress, String outputPath, String errorMsg,
                              LocalDateTime submittedAt, LocalDateTime startedAt, LocalDateTime finishedAt,
-                             LocalDateTime createTime)
+                             String reviewResult, String reviewComment, String reviewBy,
+                             LocalDateTime reviewTime, LocalDateTime createTime)
         implements Serializable {
 }

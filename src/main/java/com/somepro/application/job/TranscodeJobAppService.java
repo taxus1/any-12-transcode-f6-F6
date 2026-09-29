@@ -19,13 +19,14 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 /**
- * 转码任务用例编排（应用层）：提交 / 撤销 / 重试 / 节点领取 / 上报进度 / 上报结果 / 查看 / 分页。
+ * 转码任务用例编排（应用层）：提交 / 撤销 / 重试 / 节点领取 / 上报进度 / 上报结果 /
+ * 人工审核（通过/驳回）/ 待审清单 / 查看 / 分页。
  *
  * 不写业务规则（规则在领域层 TranscodeJob），只做编排：
  * - 提交前校验素材与档位状态、归属部门一致性、类型匹配、无同档位未完成任务；
- * - 重试前校验任务仍是失败态且未到尝试上限（领域层）、素材与档位还在且启用；
+ * - 重试前校验任务仍是失败态、未被审核驳回且未到尝试上限（领域层）、素材与档位还在且启用；
  * - 并发重复提交与任务编号分配由仓储在事务里兜底（见 TranscodeJobRepository.submitNew）；
- * - 领取 / 进度 / 结果 / 重试的并发互斥由仓储的条件更新兜底（见 TranscodeJobRepository 各 *If* 方法）；
+ * - 领取 / 进度 / 结果 / 重试 / 审核的并发互斥由仓储的条件更新兜底（见 TranscodeJobRepository 各 *If* 方法）；
  * - 出入参都是领域对象，不认识 PO、也不认识 VO。
  */
 @Service
@@ -154,6 +155,38 @@ public class TranscodeJobAppService {
                     }
                     return transcodeJobRepository.finishIfRunning(job);
                 });
+    }
+
+    /**
+     * 人工审核一条跑成功的任务：结论 PASS 通过 / REJECT 驳回，由审核人本人提交（reviewBy 取登录
+     * 账号，接口层从认证信息解析后传入，不接受请求参数代填）。
+     *
+     * - 只有跑成功（SUCCESS）、还没审过的任务能审；待处理 / 正在跑 / 已失败 / 已撤销都挡回去；
+     * - 驳回必须写清审核意见（哪不行），意见空白不给过；通过可以不写意见；
+     * - 通过：任务落 DONE、素材算完成（DONE），不再进待审清单；
+     *   驳回：任务落 FAILED、素材退回可转码（READY），回头重新提；驳过的结论不许被新结论或重试盖；
+     * - 两个人同时审只认先到的那次（领域校验 + 仓储 WHERE status=SUCCESS AND review_result IS NULL
+     *   双重兜底），晚到的拿到明确提示。
+     */
+    public Mono<TranscodeJob> review(Long id, String result, String comment, String reviewBy) {
+        if (reviewBy == null || reviewBy.isBlank()) {
+            // 正常登录访问不会走到这（接口层从认证信息取登录账号）；这是给「别让人代填」兜底
+            return Mono.error(new BizException("拿不到当前登录审核人，不能审核"));
+        }
+        return transcodeJobRepository.findById(id)
+                .switchIfEmpty(Mono.error(new BizException("转码任务不存在：" + id)))
+                .flatMap(job -> {
+                    job.review(result, comment, reviewBy);
+                    return transcodeJobRepository.reviewIfSuccess(job);
+                });
+    }
+
+    /**
+     * 待审清单分页：只翻跑成功（SUCCESS）、还没落审核结论的任务；按部门翻（ownerDept 可空，
+     * 不填就是全量待审），一行一页带任务编号。已审过的（DONE/驳回 FAILED）与已软删的都不出现。
+     */
+    public Mono<PageResult<TranscodeJob>> pagePendingReview(int pageNum, int pageSize, String ownerDept) {
+        return transcodeJobRepository.pagePendingReview(pageNum, pageSize, ownerDept);
     }
 
     /** 某任务的执行记录：第几次跑、哪台节点领的、几点开始、几点结束。 */

@@ -12,6 +12,7 @@ import com.somepro.domain.media.repository.MediaAssetRepository;
 import com.somepro.domain.profile.model.ProfileStatus;
 import com.somepro.domain.profile.model.TranscodeProfile;
 import com.somepro.domain.profile.repository.TranscodeProfileRepository;
+import com.somepro.domain.shared.model.PageResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Mono;
@@ -184,9 +185,10 @@ class TranscodeJobAppServiceTest {
 
     @Test
     void retryShouldFailWhenNotFailed() {
-        // 还在排队等领的、正在跑的、已经成功的、被撤掉的，都不该能重试
+        // 还在排队等领的、正在跑的、已经成功的、审核通过的、被撤掉的，都不该能重试
         for (JobStatus status : new JobStatus[]{
-                JobStatus.PENDING, JobStatus.RUNNING, JobStatus.SUCCESS, JobStatus.CANCELLED}) {
+                JobStatus.PENDING, JobStatus.RUNNING, JobStatus.SUCCESS,
+                JobStatus.DONE, JobStatus.CANCELLED}) {
             TranscodeJob job = pendingJob();
             job.setStatus(status);
             when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
@@ -269,6 +271,14 @@ class TranscodeJobAppServiceTest {
     private TranscodeJob runningJob() {
         TranscodeJob job = pendingJob();
         job.claim();
+        return job;
+    }
+
+    /** 造一条节点已报成功、等着人审的 SUCCESS 任务（attemptCount=1）。 */
+    private TranscodeJob succeededJob() {
+        TranscodeJob job = runningJob();
+        job.reportProgress(100);
+        job.succeed("/out/a.mp4", null);
         return job;
     }
 
@@ -432,8 +442,117 @@ class TranscodeJobAppServiceTest {
     }
 
     @Test
-    void listAttemptsShouldFailWhenJobMissing() {
+    void reviewShouldFailWhenJobMissing() {
         when(jobRepository.findById(9L)).thenReturn(Mono.empty());
+
+        assertThrows(BizException.class,
+                () -> service.review(9L, "PASS", null, "zhangsan").block());
+        verify(jobRepository, never()).reviewIfSuccess(any());
+    }
+
+    @Test
+    void reviewShouldFailWhenReviewerMissing() {
+        // 审核人取登录账号，缺失直接挡回（不许代填），连任务都不必查
+        assertThrows(BizException.class, () -> service.review(9L, "PASS", null, null).block());
+        assertThrows(BizException.class, () -> service.review(9L, "PASS", null, "  ").block());
+        verify(jobRepository, never()).findById(any());
+        verify(jobRepository, never()).reviewIfSuccess(any());
+    }
+
+    @Test
+    void reviewShouldFailWhenJobNotSucceeded() {
+        // 待处理 / 正在跑 / 已失败 / 已撤销都不能审（已审过的由领域 + 仓储双重挡回）
+        for (JobStatus status : new JobStatus[]{
+                JobStatus.PENDING, JobStatus.RUNNING, JobStatus.FAILED, JobStatus.CANCELLED}) {
+            TranscodeJob job = pendingJob();
+            job.setStatus(status);
+            when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+
+            assertThrows(BizException.class,
+                    () -> service.review(9L, "PASS", null, "zhangsan").block());
+        }
+        verify(jobRepository, never()).reviewIfSuccess(any());
+    }
+
+    @Test
+    void reviewShouldFailWhenRejectWithoutComment() {
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(succeededJob()));
+
+        assertThrows(BizException.class,
+                () -> service.review(9L, "REJECT", null, "lisi").block());
+        assertThrows(BizException.class,
+                () -> service.review(9L, "REJECT", "  ", "lisi").block());
+        verify(jobRepository, never()).reviewIfSuccess(any());
+    }
+
+    @Test
+    void reviewShouldFailWhenResultInvalid() {
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(succeededJob()));
+
+        assertThrows(BizException.class,
+                () -> service.review(9L, "OK", null, "lisi").block());
+        verify(jobRepository, never()).reviewIfSuccess(any());
+    }
+
+    @Test
+    void reviewPassShouldPersistDoneJob() {
+        TranscodeJob job = succeededJob();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+        when(jobRepository.reviewIfSuccess(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        TranscodeJob done = service.review(9L, "pass", null, " zhangsan ").block();
+
+        assertEquals(JobStatus.DONE, done.getStatus());
+        assertEquals("PASS", done.getReviewResult());
+        assertEquals("zhangsan", done.getReviewBy());
+        assertNotNull(done.getReviewTime());
+        verify(jobRepository).reviewIfSuccess(any());
+    }
+
+    @Test
+    void reviewRejectShouldPersistFailedJob() {
+        TranscodeJob job = succeededJob();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+        when(jobRepository.reviewIfSuccess(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        TranscodeJob rejected = service.review(9L, "REJECT", " 花屏 ", "lisi").block();
+
+        assertEquals(JobStatus.FAILED, rejected.getStatus());
+        assertEquals("REJECT", rejected.getReviewResult());
+        assertEquals("花屏", rejected.getReviewComment());
+        assertEquals("lisi", rejected.getReviewBy());
+        verify(jobRepository).reviewIfSuccess(any());
+    }
+
+    @Test
+    void retryShouldFailWhenJobWasReviewRejected() {
+        // 审核驳回的 FAILED 不能重试：连素材/档位都不必再看
+        TranscodeJob job = succeededJob();
+        job.review("REJECT", "花屏", "lisi");
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+
+        BizException e = assertThrows(BizException.class, () -> service.retry(9L).block());
+        assertEquals("该任务已被审核驳回（结论：REJECT，审核人：lisi），不能重试覆盖原结论，请重新提交新任务",
+                e.getMessage());
+        verify(assetRepository, never()).findById(any());
+        verify(jobRepository, never()).requeueIfFailed(any());
+    }
+
+    @Test
+    void pendingReviewShouldDelegateToRepository() {
+        PageResult<TranscodeJob> page = new PageResult<>(List.of(succeededJob()), 1, 1, 20);
+        when(jobRepository.pagePendingReview(1, 20, "技术部")).thenReturn(Mono.just(page));
+
+        PageResult<TranscodeJob> result = service.pagePendingReview(1, 20, "技术部").block();
+
+        assertEquals(1, result.total());
+        assertEquals(JobStatus.SUCCESS, result.content().get(0).getStatus());
+        assertEquals("TJ-2026-0001", result.content().get(0).getJobNo());
+        verify(jobRepository).pagePendingReview(1, 20, "技术部");
+    }
+
+    @Test
+    void listAttemptsShouldFailWhenJobMissing() {        when(jobRepository.findById(9L)).thenReturn(Mono.empty());
 
         assertThrows(BizException.class, () -> service.listAttempts(9L).block());
         verify(jobRepository, never()).listAttempts(any());

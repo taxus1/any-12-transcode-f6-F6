@@ -8,6 +8,8 @@ import com.somepro.interfaces.rest.job.converter.TranscodeJobVoConverter;
 import com.somepro.interfaces.rest.job.vo.JobAttemptVO;
 import com.somepro.interfaces.rest.job.vo.TranscodeJobVO;
 import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -20,11 +22,14 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 /**
- * 转码任务接口（用户接口层）：提交 / 撤销 / 重试 / 节点领取 / 上报进度 / 上报结果 / 执行记录 / 查看 / 分页。
+ * 转码任务接口（用户接口层）：提交 / 撤销 / 重试 / 节点领取 / 上报进度 / 上报结果 /
+ * 人工审核（通过/驳回）/ 待审清单 / 执行记录 / 查看 / 分页。
  *
  * 只做协议适配（参数解析、VO 转换、返回包装），业务编排交给应用层：
  * - 统一返回 Mono<Result<T>>；
  * - 分页透传 pageNum/pageSize，不要写死；查询条件全部可空，一个都不填就是全量分页；
+ * - 审核人不取请求参数：用 @AuthenticationPrincipal 从登录认证信息里取登录账号，谁登录就是谁审，
+ *   不许代填结论与意见；
  * - ⚠️ 不直接返回领域对象：一律经 TranscodeJobVoConverter 转成 VO，
  *   否则 delFlag / createBy / updateBy 等内部字段会被序列化出去。
  */
@@ -105,6 +110,36 @@ public class TranscodeJobController {
                                                      LocalDateTime finishedAt) {
         return transcodeJobAppService.reportResult(id, result, outputPath, errorMsg, finishedAt)
                 .map(TranscodeJobVoConverter::toVo)
+                .map(Result::ok);
+    }
+
+    /**
+     * 人工审核：result 只认 PASS / REJECT（大小写不敏感）。
+     * 审核人取当前登录账号（@AuthenticationPrincipal），不接受参数代填；
+     * REJECT 必须带 comment（写清哪不行，空白不给过），PASS 的 comment 可不传。
+     * 同一任务同时只落一次结论，先到的算数，晚到的拿到明确提示。
+     */
+    @PostMapping("/{id}/review")
+    public Mono<Result<TranscodeJobVO>> review(@PathVariable Long id,
+                                               @RequestParam String result,
+                                               @RequestParam(required = false) String comment,
+                                               @AuthenticationPrincipal UserDetails principal) {
+        return transcodeJobAppService.review(id, result, comment, principal == null ? null : principal.getUsername())
+                .map(TranscodeJobVoConverter::toVo)
+                .map(Result::ok);
+    }
+
+    /**
+     * 待审清单：只列跑成功（SUCCESS）、还没审核结论的任务，行里带任务编号。
+     * ownerDept 不传看全部部门、传了只看该部门；pageNum/pageSize 透传。
+     */
+    @GetMapping("/pending-review")
+    public Mono<Result<PageVO<TranscodeJobVO>>> pendingReview(
+            @RequestParam(defaultValue = "1") int pageNum,
+            @RequestParam(defaultValue = "20") int pageSize,
+            @RequestParam(required = false) String ownerDept) {
+        return transcodeJobAppService.pagePendingReview(pageNum, pageSize, ownerDept)
+                .map(TranscodeJobVoConverter::toPageVo)
                 .map(Result::ok);
     }
 
