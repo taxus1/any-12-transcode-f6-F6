@@ -36,6 +36,10 @@ public final class TranscodeJobVoConverter {
                 domain.getSubmittedAt(),
                 domain.getStartedAt(),
                 domain.getFinishedAt(),
+                domain.getReviewResult(),
+                domain.getReviewComment(),
+                domain.getReviewBy(),
+                domain.getReviewTime(),
                 domain.getCreateTime());
     }
 

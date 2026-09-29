@@ -8,6 +8,7 @@ import com.somepro.interfaces.rest.job.converter.TranscodeJobVoConverter;
 import com.somepro.interfaces.rest.job.vo.JobAttemptVO;
 import com.somepro.interfaces.rest.job.vo.TranscodeJobVO;
 import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -20,7 +21,7 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 /**
- * 转码任务接口（用户接口层）：提交 / 撤销 / 重试 / 节点领取 / 上报进度 / 上报结果 / 执行记录 / 查看 / 分页。
+ * 转码任务接口（用户接口层）：提交 / 撤销 / 重试 / 节点领取 / 上报进度 / 上报结果 / 审核 / 待审清单 / 执行记录 / 查看 / 分页。
  *
  * 只做协议适配（参数解析、VO 转换、返回包装），业务编排交给应用层：
  * - 统一返回 Mono<Result<T>>；
@@ -105,6 +106,31 @@ public class TranscodeJobController {
                                                      LocalDateTime finishedAt) {
         return transcodeJobAppService.reportResult(id, result, outputPath, errorMsg, finishedAt)
                 .map(TranscodeJobVoConverter::toVo)
+                .map(Result::ok);
+    }
+
+    /**
+     * 人工审核：result 只认 PASS / REJECT；REJECT 必须带 comment，PASS 可不带。
+     * 审核人只取当前登录账号，不由请求参数传入；同一任务同时提交两次时只认先到的一次。
+     */
+    @PostMapping({"/{id}/review", "/{id}/audit"})
+    public Mono<Result<TranscodeJobVO>> review(@PathVariable Long id,
+                                               @RequestParam String result,
+                                               @RequestParam(required = false) String comment,
+                                               Authentication authentication) {
+        return transcodeJobAppService.review(id, result, comment, authentication.getName())
+                .map(TranscodeJobVoConverter::toVo)
+                .map(Result::ok);
+    }
+
+    /** 待审清单：必须按归属部门翻页；行里带任务编号，只包含 SUCCESS 且尚未审核的任务。 */
+    @GetMapping({"/review/page", "/review/pending"})
+    public Mono<Result<PageVO<TranscodeJobVO>>> pagePendingReview(
+            @RequestParam(defaultValue = "1") int pageNum,
+            @RequestParam(defaultValue = "20") int pageSize,
+            @RequestParam String ownerDept) {
+        return transcodeJobAppService.pagePendingReview(pageNum, pageSize, ownerDept)
+                .map(TranscodeJobVoConverter::toPageVo)
                 .map(Result::ok);
     }
 

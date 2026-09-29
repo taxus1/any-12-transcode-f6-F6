@@ -9,6 +9,7 @@ import com.somepro.common.exception.BizException;
 import com.somepro.domain.job.model.AttemptStatus;
 import com.somepro.domain.job.model.JobAttempt;
 import com.somepro.domain.job.model.JobStatus;
+import com.somepro.domain.job.model.ReviewResult;
 import com.somepro.domain.job.model.TranscodeJob;
 import com.somepro.domain.job.repository.TranscodeJobRepository;
 import com.somepro.domain.media.model.AssetStatus;
@@ -144,6 +145,64 @@ public class TranscodeJobRepositoryImpl implements TranscodeJobRepository {
     }
 
     @Override
+    public Mono<PageResult<TranscodeJob>> pagePendingReview(int pageNum, int pageSize, String ownerDept) {
+        return this.<PageResult<TranscodeJob>>blocking(() -> {
+            try {
+                PageHelper.startPage(pageNum, pageSize);
+                // 待审只认「转码成功 + 尚未有人落审核结论」；@TableLogic 自动排除已删除任务。
+                List<TranscodeJobPO> rows = transcodeJobMapper.selectList(Wrappers.<TranscodeJobPO>lambdaQuery()
+                        .eq(TranscodeJobPO::getOwnerDept, ownerDept)
+                        .eq(TranscodeJobPO::getStatus, JobStatus.SUCCESS.name())
+                        .isNull(TranscodeJobPO::getReviewResult)
+                        .orderByAsc(TranscodeJobPO::getSubmittedAt)
+                        .orderByAsc(TranscodeJobPO::getId));
+                long total = rows instanceof com.github.pagehelper.Page
+                        ? ((com.github.pagehelper.Page<?>) rows).getTotal()
+                        : rows.size();
+                List<TranscodeJob> content = rows.stream()
+                        .map(TranscodeJobPoConverter::toDomain)
+                        .collect(Collectors.toList());
+                return new PageResult<>(content, total, pageNum, pageSize);
+            } finally {
+                PageHelper.clearPage();
+            }
+        });
+    }
+
+    @Override
+    public Mono<TranscodeJob> reviewIfSuccessPending(TranscodeJob job) {
+        return blocking(() -> transactionTemplate.execute(status -> {
+            // ① 原子审核：只有 SUCCESS 且 review_result 仍为空才写入。
+            //    两个人同时提交时 InnoDB 行锁串行，先到 rows=1，后到看到 review_result 已有值，rows=0，
+            //    旧结论、审核人、审核时刻都不会被覆盖。
+            int rows = transcodeJobMapper.update(new TranscodeJobPO(),
+                    Wrappers.<TranscodeJobPO>lambdaUpdate()
+                            .set(TranscodeJobPO::getStatus, job.getStatus().name())
+                            .set(TranscodeJobPO::getReviewResult, job.getReviewResult())
+                            .set(TranscodeJobPO::getReviewComment, job.getReviewComment())
+                            .set(TranscodeJobPO::getReviewBy, job.getReviewBy())
+                            .set(TranscodeJobPO::getReviewTime, job.getReviewTime())
+                            .eq(TranscodeJobPO::getId, job.getId())
+                            .eq(TranscodeJobPO::getStatus, JobStatus.SUCCESS.name())
+                            .isNull(TranscodeJobPO::getReviewResult));
+            if (rows == 0) {
+                throw new BizException(reviewConflictMessage(job.getId()));
+            }
+            // ② 素材联动：通过 DONE；驳回退回 READY，回头可以重新提交。
+            String assetStatus = ReviewResult.PASS.name().equals(job.getReviewResult())
+                    ? AssetStatus.DONE.name()
+                    : AssetStatus.READY.name();
+            int assetRows = mediaAssetMapper.update(new MediaAssetPO(), Wrappers.<MediaAssetPO>lambdaUpdate()
+                    .set(MediaAssetPO::getStatus, assetStatus)
+                    .eq(MediaAssetPO::getId, job.getAssetId()));
+            if (assetRows == 0) {
+                throw new BizException("素材不存在或已删除，无法完成审核：" + job.getAssetId());
+            }
+            return TranscodeJobPoConverter.toDomain(transcodeJobMapper.selectById(job.getId()));
+        }));
+    }
+
+    @Override
     public Mono<TranscodeJob> cancelIfPending(TranscodeJob job) {
         return blocking(() -> {
             TranscodeJobPO update = new TranscodeJobPO();
@@ -170,7 +229,7 @@ public class TranscodeJobRepositoryImpl implements TranscodeJobRepository {
             //    进度归零、起止时刻清空（attempt_count 不动，下次领取接着往下排）。
             //    连点重试 / 多人同时重试时 InnoDB 行锁把请求串行，先到的 rows=1，
             //    后到的看到状态已是 PENDING，rows=0 —— 同一条任务只排一次，不会重复入队；
-            //    PENDING/RUNNING/SUCCESS/CANCELLED 的行也不会被改掉。
+            //    PENDING/RUNNING/SUCCESS/CANCELLED 的行不会被改掉；审核驳回的 FAILED 也不能靠重试抹掉旧结论。
             //    用空实体 + wrapper.set 显式置 null（实体里字段为 null 不会被拼进 SET）。
             int rows = transcodeJobMapper.update(new TranscodeJobPO(),
                     Wrappers.<TranscodeJobPO>lambdaUpdate()
@@ -180,7 +239,8 @@ public class TranscodeJobRepositoryImpl implements TranscodeJobRepository {
                             .set(TranscodeJobPO::getStartedAt, null)
                             .set(TranscodeJobPO::getFinishedAt, null)
                             .eq(TranscodeJobPO::getId, job.getId())
-                            .eq(TranscodeJobPO::getStatus, JobStatus.FAILED.name()));
+                            .eq(TranscodeJobPO::getStatus, JobStatus.FAILED.name())
+                            .isNull(TranscodeJobPO::getReviewResult));
             if (rows == 0) {
                 throw new BizException(requeueConflictMessage(job.getId()));
             }
@@ -286,6 +346,20 @@ public class TranscodeJobRepositoryImpl implements TranscodeJobRepository {
                 .collect(Collectors.toList()));
     }
 
+    /** 审核 rows=0 时的明确提示：重读任务，区分「已审过」与「当前不能审」。 */
+    private String reviewConflictMessage(Long jobId) {
+        TranscodeJobPO current = transcodeJobMapper.selectById(jobId);
+        if (current == null) {
+            return "转码任务不存在：" + jobId;
+        }
+        if (current.getReviewResult() != null) {
+            return "审核失败，任务已由 " + current.getReviewBy() + " 审核为 "
+                    + current.getReviewResult() + "，原结论不能被覆盖";
+        }
+        return "审核失败，任务当前状态：" + current.getStatus()
+                + "（只有转码成功（SUCCESS）且待审核的任务才能审核）";
+    }
+
     /** 条件更新 rows=0 时的明确提示：重读当前状态，告诉调用方任务现在到底什么样。 */
     private String conflictMessage(Long jobId, String action) {
         TranscodeJobPO current = transcodeJobMapper.selectById(jobId);
@@ -304,6 +378,9 @@ public class TranscodeJobRepositoryImpl implements TranscodeJobRepository {
         }
         if (JobStatus.PENDING.name().equals(current.getStatus())) {
             return "重试失败，任务已重新排队（PENDING），请勿重复操作";
+        }
+        if (ReviewResult.REJECT.name().equals(current.getReviewResult())) {
+            return "重试失败，任务已被审核驳回，请重新提交，不能覆盖原审核结论";
         }
         return "重试失败，任务当前状态：" + current.getStatus()
                 + "（只有失败（FAILED）的任务才能重试）";

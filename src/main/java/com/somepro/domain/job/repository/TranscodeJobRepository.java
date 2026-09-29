@@ -31,6 +31,21 @@ public interface TranscodeJobRepository {
                                         String ownerDept, Long assetId, Long profileId);
 
     /**
+     * 待审清单：按归属部门分页，只包含转码成功且还没有审核结论的任务。
+     * 已删除任务由 @TableLogic 自动排除；审核通过或驳回后都不会再出现在清单里。
+     */
+    Mono<PageResult<TranscodeJob>> pagePendingReview(int pageNum, int pageSize, String ownerDept);
+
+    /**
+     * 审核落库（乐观条件更新，一个事务里两件事）：
+     * ① 仅当库里仍是 SUCCESS 且 review_result IS NULL 才写入结论、审核人与审核时刻；
+     *   驳回同时把任务改成 FAILED，通过则保持 SUCCESS。两个人同时点只认先到的一次，
+     *   后来的 rows=0，原有结论、审核人和审核时刻均不被覆盖；
+     * ② 素材联动：通过改成 DONE，驳回退回 READY。
+     */
+    Mono<TranscodeJob> reviewIfSuccessPending(TranscodeJob job);
+
+    /**
      * 撤销落库（乐观条件更新）：仅当库里仍是 PENDING 才更新为 CANCELLED，
      * 防止「查出来是待处理 → 节点同时领走 → 又被撤销」的并发窗口。
      */
@@ -42,7 +57,7 @@ public interface TranscodeJobRepository {
      *    （attempt_count 不动，下次领取时接着往下排，不在这里新增执行记录）——
      *    同一条任务被连点几下、或几个人同时点，InnoDB 行锁把请求串行，只有第一个 UPDATE
      *    rows=1，其余 rows=0，保证只排一次、不重复入队；PENDING/RUNNING/SUCCESS/CANCELLED
-     *    同样在这里被挡回；
+     *    以及审核驳回的 FAILED 同样在这里被挡回；
      * ② 对应素材跟着退回可转码（READY），等任务再次被领走时再进转码中。
      */
     Mono<TranscodeJob> requeueIfFailed(TranscodeJob job);

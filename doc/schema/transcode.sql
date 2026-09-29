@@ -78,7 +78,8 @@ CREATE TABLE IF NOT EXISTS t_transcode_job (
     KEY idx_asset (asset_id),
     KEY idx_profile (profile_id),
     KEY idx_status (status),
-    KEY idx_owner_time (owner_dept, submitted_at)
+    KEY idx_owner_time (owner_dept, submitted_at),
+    KEY idx_owner_review (owner_dept, status, review_result, submitted_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='转码任务';
 
 -- 4) 任务执行尝试（每次真正跑一遍记一条）

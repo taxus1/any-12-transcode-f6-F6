@@ -176,6 +176,80 @@ class TranscodeJobTest {
     }
 
     @Test
+    void reviewShouldOnlyAllowSuccessfulUnreviewedJob() {
+        for (JobStatus status : new JobStatus[]{
+                JobStatus.PENDING, JobStatus.RUNNING, JobStatus.FAILED, JobStatus.CANCELLED}) {
+            TranscodeJob job = TranscodeJob.submit(1L, 2L, "技术部", 1);
+            job.setStatus(status);
+
+            BizException e = assertThrows(BizException.class,
+                    () -> job.review("PASS", null, "reviewer", null));
+            assertEquals("只有转码成功（SUCCESS）的任务才能审核，当前状态：" + status, e.getMessage());
+        }
+    }
+
+    @Test
+    void reviewRejectShouldRequireComment() {
+        TranscodeJob job = successfulJob();
+
+        assertThrows(BizException.class, () -> job.review("REJECT", null, "reviewer", null));
+        assertThrows(BizException.class, () -> job.review("REJECT", "  ", "reviewer", null));
+        assertEquals(JobStatus.SUCCESS, job.getStatus());
+        assertNull(job.getReviewResult());
+    }
+
+    @Test
+    void reviewPassShouldKeepSuccessAndRecordReviewer() {
+        TranscodeJob job = successfulJob();
+
+        job.review("PASS", "  ", " auditor ", null);
+
+        assertEquals(JobStatus.SUCCESS, job.getStatus());
+        assertEquals("PASS", job.getReviewResult());
+        assertNull(job.getReviewComment());
+        assertEquals("auditor", job.getReviewBy());
+        assertNotNull(job.getReviewTime());
+    }
+
+    @Test
+    void reviewRejectShouldMarkFailedAndPreserveComment() {
+        TranscodeJob job = successfulJob();
+
+        job.review("REJECT", " 画面花屏 ", "auditor", null);
+
+        assertEquals(JobStatus.FAILED, job.getStatus());
+        assertEquals("REJECT", job.getReviewResult());
+        assertEquals("画面花屏", job.getReviewComment());
+        assertEquals("auditor", job.getReviewBy());
+        assertNotNull(job.getReviewTime());
+    }
+
+    @Test
+    void reviewShouldNotAllowOldConclusionToBeOverwritten() {
+        TranscodeJob job = successfulJob();
+        job.review("REJECT", "画面花屏", "first", null);
+
+        BizException e = assertThrows(BizException.class,
+                () -> job.review("PASS", null, "second", null));
+        assertEquals("任务已审核，结论为：REJECT，不能再用新结论覆盖原结论", e.getMessage());
+        assertEquals("REJECT", job.getReviewResult());
+        assertEquals("画面花屏", job.getReviewComment());
+        assertEquals("first", job.getReviewBy());
+        assertEquals(JobStatus.FAILED, job.getStatus());
+    }
+
+    @Test
+    void retryShouldRejectReviewedRejection() {
+        TranscodeJob job = successfulJob();
+        job.review("REJECT", "画面花屏", "auditor", null);
+
+        BizException e = assertThrows(BizException.class, job::retry);
+        assertEquals("任务已被审核驳回，请重新提交，不能用重试覆盖原审核结论", e.getMessage());
+        assertEquals("REJECT", job.getReviewResult());
+        assertEquals(JobStatus.FAILED, job.getStatus());
+    }
+
+    @Test
     void retryShouldCleanFieldsButKeepAttemptCount() {
         // 失败说明清掉、进度归零、起止时刻清空，已跑过的次数留着不动，干干净净回 PENDING
         TranscodeJob job = failedJob(2);
@@ -226,6 +300,13 @@ class TranscodeJobTest {
     private static TranscodeJob claimedJob() {
         TranscodeJob job = TranscodeJob.submit(1L, 2L, "技术部", 1);
         job.claim();
+        return job;
+    }
+
+    /** 造一条已经跑成功、等待人工审核的任务。 */
+    private static TranscodeJob successfulJob() {
+        TranscodeJob job = claimedJob();
+        job.succeed("/out/a.mp4", null);
         return job;
     }
 

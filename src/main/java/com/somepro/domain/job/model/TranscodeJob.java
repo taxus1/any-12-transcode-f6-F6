@@ -18,10 +18,12 @@ import java.time.LocalDateTime;
  *   submittedAt 记提交时刻；
  * - 只有 PENDING 能被节点领取（claim），领取后 RUNNING、记开始时刻、已尝试次数 +1；
  * - 只有 RUNNING 能报进度、出结果；进度是 0-100 的整数且只能往前；
- * - SUCCESS / CANCELLED 是终态：出了结果的任务不再接受任何上报，也不会再被领取；
- * - FAILED 在已尝试次数未到上限（maxAttempts，提交时定死）时，可由有权限的人重排（retry）
- *   回 PENDING 重新排队：清掉失败说明、进度归零、起止时刻清空，attemptCount 原样保留，
- *   不新增执行记录（下次被领取时 attemptNo 接着上一次往下排）；到了上限的 FAILED 不能再重排；
+ * - SUCCESS 表示节点执行已成功，之后不再接受节点上报或领取，但仍可由人工审核；
+ * - SUCCESS 表示转码已跑成功，但还要等人工审核。审核通过时任务保留 SUCCESS，
+ *   审核驳回时任务改成 FAILED；审核结论只允许落一次，旧结论不能被覆盖；
+ * - FAILED 在已尝试次数未到上限（maxAttempts，提交时定死）且没有被审核驳回过时，
+ *   可由有权限的人重排（retry）回 PENDING 重新排队。审核驳回的任务需要重新提交，
+ *   不能拿重试抹掉旧审核记录；
  * - 撤销只能发生在 PENDING（还没被节点领走），且必须写明撤销原因；
  *   表里没有单独的取消原因列，原因落在 errorMsg；
  * - 任务编号 jobNo 形如 TJ-2026-0001，由仓储按年顺序分配（应用层不给编号）。
@@ -79,7 +81,7 @@ public class TranscodeJob extends BaseEntity {
     /** 结束时刻（成功/失败/取消）。 */
     private LocalDateTime finishedAt;
 
-    /** 审核结果（PASS/REJECT），本聚合当前不推进，留给后续审核流程。 */
+    /** 审核结果（PASS/REJECT），只允许由审核人落一次。 */
     private String reviewResult;
     private String reviewComment;
     private String reviewBy;
@@ -172,6 +174,41 @@ public class TranscodeJob extends BaseEntity {
         this.finishedAt = finishedAt == null ? LocalDateTime.now() : finishedAt;
     }
 
+    /**
+     * 领域行为：人工审核一条转码成功的任务。
+     *
+     * - 只有真正跑成功（SUCCESS）且还没有审核结论的任务能审；PENDING/RUNNING/FAILED/CANCELLED
+     *   以及已经审过的任务都不能再落结论；
+     * - 结论只认 PASS / REJECT；REJECT 必须写清哪里不行，PASS 的意见可以不写；
+     * - PASS：任务保持 SUCCESS，表示这条任务到此为止；素材联动为 DONE 由仓储处理；
+     * - REJECT：任务改成 FAILED；素材联动退回 READY 由仓储处理，回头重新提交；
+     * - 审核人取当前登录人，不由请求参数代填；审核时刻在领域内记录。
+     */
+    public void review(String result, String comment, String reviewer, LocalDateTime reviewTime) {
+        ReviewResult review = ReviewResult.of(result);
+        if (reviewResult != null) {
+            throw new BizException("任务已审核，结论为：" + reviewResult
+                    + "，不能再用新结论覆盖原结论");
+        }
+        if (status != JobStatus.SUCCESS) {
+            throw new BizException("只有转码成功（SUCCESS）的任务才能审核，当前状态：" + status);
+        }
+        if (reviewer == null || reviewer.isBlank()) {
+            throw new BizException("审核人不能为空");
+        }
+        String normalizedComment = (comment == null || comment.isBlank()) ? null : comment.trim();
+        if (review == ReviewResult.REJECT && (normalizedComment == null || normalizedComment.isBlank())) {
+            throw new BizException("审核驳回必须填写审核意见，写清哪里不行");
+        }
+        this.reviewResult = review.name();
+        this.reviewComment = normalizedComment;
+        this.reviewBy = reviewer.trim();
+        this.reviewTime = reviewTime == null ? LocalDateTime.now() : reviewTime;
+        if (review == ReviewResult.REJECT) {
+            this.status = JobStatus.FAILED;
+        }
+    }
+
     /** 出结果的前置守卫：只有 RUNNING 能出结果；已出结果的再来报，原样挡回、不做任何修改。 */
     private void requireRunning() {
         if (status != JobStatus.RUNNING) {
@@ -209,6 +246,7 @@ public class TranscodeJob extends BaseEntity {
      *   已成功的（SUCCESS）、已撤销的（CANCELLED）都不允许；
      * - 最多能跑几次在建任务时就定死了（maxAttempts）：已尝试次数到了上限的，
      *   给明确提示、不放进队列，免得到顶的单子没完没了占位置；
+     * - 审核驳回造成的 FAILED 保留审核痕迹，不能重试，只能重新提交；
      * - 干干净净重新排队：上回留下的失败说明清掉、进度归零、起止时刻清空，
      *   已跑过的次数（attemptCount）原样保留 —— 下次被节点领走时 attemptNo 接着往下排。
      *
@@ -219,6 +257,9 @@ public class TranscodeJob extends BaseEntity {
     public void retry() {
         if (status != JobStatus.FAILED) {
             throw new BizException("只有失败（FAILED）的任务才能重试，当前状态：" + status);
+        }
+        if (ReviewResult.REJECT.name().equals(reviewResult)) {
+            throw new BizException("任务已被审核驳回，请重新提交，不能用重试覆盖原审核结论");
         }
         if (attemptCount >= maxAttempts) {
             throw new BizException("任务已达到最大尝试次数（已尝试 " + attemptCount

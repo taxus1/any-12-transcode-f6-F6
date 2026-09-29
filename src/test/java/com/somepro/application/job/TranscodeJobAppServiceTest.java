@@ -12,6 +12,7 @@ import com.somepro.domain.media.repository.MediaAssetRepository;
 import com.somepro.domain.profile.model.ProfileStatus;
 import com.somepro.domain.profile.model.TranscodeProfile;
 import com.somepro.domain.profile.repository.TranscodeProfileRepository;
+import com.somepro.domain.shared.model.PageResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Mono;
@@ -272,6 +273,12 @@ class TranscodeJobAppServiceTest {
         return job;
     }
 
+    private TranscodeJob successfulJob() {
+        TranscodeJob job = runningJob();
+        job.succeed("/out/a.mp4", null);
+        return job;
+    }
+
     /** 造一条跑过一次后失败的 FAILED 任务（attemptCount=1，未到缺省上限 3，可重试）。 */
     private TranscodeJob failedJob() {
         return failedJob(1);
@@ -429,6 +436,70 @@ class TranscodeJobAppServiceTest {
         assertEquals(JobStatus.SUCCESS, job.getStatus());
         verify(jobRepository, never()).finishIfRunning(any());
         verify(jobRepository, never()).reportProgressIfRunning(any());
+    }
+
+    @Test
+    void reviewShouldFailWhenJobMissing() {
+        when(jobRepository.findById(9L)).thenReturn(Mono.empty());
+
+        assertThrows(BizException.class,
+                () -> service.review(9L, "PASS", null, "auditor").block());
+        verify(jobRepository, never()).reviewIfSuccessPending(any());
+    }
+
+    @Test
+    void reviewShouldFailWhenRejectCommentBlank() {
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(successfulJob()));
+
+        assertThrows(BizException.class,
+                () -> service.review(9L, "REJECT", "  ", "auditor").block());
+        verify(jobRepository, never()).reviewIfSuccessPending(any());
+    }
+
+    @Test
+    void reviewPassShouldPersistUsingCurrentReviewer() {
+        TranscodeJob job = successfulJob();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+        when(jobRepository.reviewIfSuccessPending(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        TranscodeJob reviewed = service.review(9L, "pass", null, " auditor ").block();
+
+        assertEquals(JobStatus.SUCCESS, reviewed.getStatus());
+        assertEquals("PASS", reviewed.getReviewResult());
+        assertEquals("auditor", reviewed.getReviewBy());
+        assertNotNull(reviewed.getReviewTime());
+        verify(jobRepository).reviewIfSuccessPending(any());
+    }
+
+    @Test
+    void reviewRejectShouldPersistFailedJob() {
+        TranscodeJob job = successfulJob();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+        when(jobRepository.reviewIfSuccessPending(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        TranscodeJob reviewed = service.review(9L, "reject", " 画面花屏 ", "auditor").block();
+
+        assertEquals(JobStatus.FAILED, reviewed.getStatus());
+        assertEquals("REJECT", reviewed.getReviewResult());
+        assertEquals("画面花屏", reviewed.getReviewComment());
+        verify(jobRepository).reviewIfSuccessPending(any());
+    }
+
+    @Test
+    void pendingReviewPageShouldRequireDept() {
+        assertThrows(BizException.class, () -> service.pagePendingReview(1, 20, "  ").block());
+        verify(jobRepository, never()).pagePendingReview(any(Integer.class), any(Integer.class), any());
+    }
+
+    @Test
+    void pendingReviewPageShouldTrimDept() {
+        when(jobRepository.pagePendingReview(1, 20, "技术部"))
+                .thenReturn(Mono.just(new PageResult<>(List.of(successfulJob()), 1, 1, 20)));
+
+        PageResult<TranscodeJob> page = service.pagePendingReview(1, 20, " 技术部 ").block();
+
+        assertEquals(1, page.content().size());
+        verify(jobRepository).pagePendingReview(1, 20, "技术部");
     }
 
     @Test

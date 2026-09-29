@@ -19,7 +19,7 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 /**
- * 转码任务用例编排（应用层）：提交 / 撤销 / 重试 / 节点领取 / 上报进度 / 上报结果 / 查看 / 分页。
+ * 转码任务用例编排（应用层）：提交 / 撤销 / 重试 / 节点领取 / 上报进度 / 上报结果 / 审核 / 待审清单 / 查看 / 分页。
  *
  * 不写业务规则（规则在领域层 TranscodeJob），只做编排：
  * - 提交前校验素材与档位状态、归属部门一致性、类型匹配、无同档位未完成任务；
@@ -154,6 +154,27 @@ public class TranscodeJobAppService {
                     }
                     return transcodeJobRepository.finishIfRunning(job);
                 });
+    }
+
+    /**
+     * 人工审核：只有真正跑成功且还没审过的任务能审。reviewer 来自当前登录态，不接受前端代填。
+     * 通过后素材 DONE；驳回后任务 FAILED、素材 READY，且旧审核结论不能再被覆盖。
+     */
+    public Mono<TranscodeJob> review(Long id, String result, String comment, String reviewer) {
+        return transcodeJobRepository.findById(id)
+                .switchIfEmpty(Mono.error(new BizException("转码任务不存在：" + id)))
+                .flatMap(job -> {
+                    job.review(result, comment, reviewer, LocalDateTime.now());
+                    return transcodeJobRepository.reviewIfSuccessPending(job);
+                });
+    }
+
+    /** 待审清单：必须指定归属部门，只返回转码成功且还没审核的任务，按页翻查。 */
+    public Mono<PageResult<TranscodeJob>> pagePendingReview(int pageNum, int pageSize, String ownerDept) {
+        if (ownerDept == null || ownerDept.isBlank()) {
+            return Mono.error(new BizException("待审清单必须指定归属部门"));
+        }
+        return transcodeJobRepository.pagePendingReview(pageNum, pageSize, ownerDept.trim());
     }
 
     /** 某任务的执行记录：第几次跑、哪台节点领的、几点开始、几点结束。 */
